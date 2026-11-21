@@ -8,12 +8,17 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 log = logging.getLogger("REPLICA")
 
-INITIAL_PRODUCT = {"id": 1, "name": "Laptop", "price": 500000, "stock": 10, "version": 1}
+INITIAL_PRODUCT = {"id": 1, "name": "Laptop", "price": 450000, "stock": 10, "version": 2}
 
 products = {1: dict(INITIAL_PRODUCT)}
 lock = threading.Lock()
 
-ACK_DELAY = 1.0
+ACK_DELAY = 0.0
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "role": "replica"}), 200
 
 
 @app.route("/products/<int:product_id>", methods=["GET"])
@@ -35,7 +40,6 @@ def replicate():
 
     log.info("received update from primary: version %s (price=%s stock=%s)",
              data["version"], data["price"], data["stock"])
-
     with lock:
         current = products.get(data["id"])
         if current is None or data["version"] > current["version"]:
@@ -59,7 +63,7 @@ def replicate():
 def reset():
     with lock:
         products[1] = dict(INITIAL_PRODUCT)
-    log.info("RESET to initial product (version 1)")
+    log.info("RESET to the starting product (price 450000, version 2)")
     return jsonify(products[1]), 200
 
 
@@ -83,14 +87,13 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5002)
     parser.add_argument("--ack-delay", type=float, default=ACK_DELAY,
-                        help="simulated latency before sending the ACK, in seconds (default 1)")
+                        help="simulated latency before sending the ACK, in seconds (default 0)")
     args = parser.parse_args()
     ACK_DELAY = args.ack_delay
 
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s",
-                        datefmt="%H:%M:%S")
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    log.info("Catalog Replica on port %s, ACK delay %ss", args.port, ACK_DELAY)
-    app.run(host=args.host, port=args.port, debug=False)
+    log.info("Catalog Replica on port %s (read-only fallback)", args.port)
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)

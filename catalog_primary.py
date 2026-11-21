@@ -9,18 +9,41 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 log = logging.getLogger("PRIMARY")
 
-INITIAL_PRODUCT = {"id": 1, "name": "Laptop", "price": 500000, "stock": 10, "version": 1}
+INITIAL_PRODUCT = {"id": 1, "name": "Laptop", "price": 450000, "stock": 10, "version": 2}
 
 products = {1: dict(INITIAL_PRODUCT)}
 lock = threading.Lock()
 
 REPLICA_URL = "http://127.0.0.1:5002" 
-ASYNC_DELAY = 5.0 
-REPLICA_TIMEOUT = 5.0 
+ASYNC_DELAY = 5.0  
+REPLICA_TIMEOUT = 5.0
+RESPONSE_DELAY = 0.0 
 
 
 def is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+@app.before_request
+def simulate_slow_primary():
+    if request.method == "GET" and RESPONSE_DELAY > 0:
+        log.info("slow mode: holding GET %s for %ss before answering", request.path, RESPONSE_DELAY)
+        time.sleep(RESPONSE_DELAY)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "role": "primary"}), 200
+
+
+@app.route("/products/<int:product_id>", methods=["GET"])
+def get_product(product_id):
+    product = products.get(product_id)
+    if product is None:
+        return jsonify({"error": f"Product with id {product_id} not found"}), 404
+    log.info("READ product %s -> price=%s stock=%s version=%s",
+             product_id, product["price"], product["stock"], product["version"])
+    return jsonify(product), 200
 
 
 def send_to_replica(snapshot):
@@ -38,16 +61,6 @@ def deliver_later(snapshot):
         log.info("async delivery done: version %s reached the replica (ACK received)", snapshot["version"])
     except (requests.RequestException, ValueError) as e:
         log.error("async delivery of version %s FAILED: %s", snapshot["version"], e)
-
-
-@app.route("/products/<int:product_id>", methods=["GET"])
-def get_product(product_id):
-    product = products.get(product_id)
-    if product is None:
-        return jsonify({"error": f"Product with id {product_id} not found"}), 404
-    log.info("READ product %s -> price=%s stock=%s version=%s",
-             product_id, product["price"], product["stock"], product["version"])
-    return jsonify(product), 200
 
 
 @app.route("/products/<int:product_id>", methods=["PUT"])
@@ -85,37 +98,39 @@ def update_product(product_id):
         log.info("async: returning SUCCESS now; delivery of version %s to replica scheduled in %ss",
                  snapshot["version"], ASYNC_DELAY)
         return jsonify({
-            "status": "SUCCESS",
-            "mode": "async",
-            "product": snapshot,
+            "status": "SUCCESS", "mode": "async", "product": snapshot,
             "replication": f"version {snapshot['version']} will reach the replica in {ASYNC_DELAY}s",
         }), 200
-    
+
     log.info("sync: sending version %s to replica and waiting for ACK ...", snapshot["version"])
     try:
         send_to_replica(snapshot)
     except (requests.RequestException, ValueError) as e:
         log.error("sync: no ACK from replica (%s). Returning FAILED.", e)
-        return jsonify({
-            "status": "FAILED",
-            "mode": "sync",
-            "error": "Replica did not acknowledge the update",
-            "product": snapshot,
-        }), 503
+        return jsonify({"status": "FAILED", "mode": "sync", "product": snapshot,
+                        "error": "Replica did not acknowledge the update"}), 503
     log.info("sync: ACK received for version %s -> returning SUCCESS", snapshot["version"])
-    return jsonify({
-        "status": "SUCCESS",
-        "mode": "sync",
-        "product": snapshot,
-        "replication": f"version {snapshot['version']} acknowledged by the replica",
-    }), 200
+    return jsonify({"status": "SUCCESS", "mode": "sync", "product": snapshot,
+                    "replication": f"version {snapshot['version']} acknowledged by the replica"}), 200
+
+
+@app.route("/admin/delay", methods=["POST"])
+def set_delay():
+    global RESPONSE_DELAY
+    data = request.get_json(silent=True)
+    seconds = data.get("seconds") if isinstance(data, dict) else None
+    if not is_number(seconds) or seconds < 0:
+        return jsonify({"error": "Body must be {\"seconds\": <number >= 0>}"}), 400
+    RESPONSE_DELAY = float(seconds)
+    log.info("response delay set to %ss", RESPONSE_DELAY)
+    return jsonify({"response_delay_seconds": RESPONSE_DELAY}), 200
 
 
 @app.route("/reset", methods=["POST"])
 def reset():
     with lock:
         products[1] = dict(INITIAL_PRODUCT)
-    log.info("RESET to initial product (version 1)")
+    log.info("RESET to the starting product (price 450000, version 2)")
     return jsonify(products[1]), 200
 
 
@@ -140,17 +155,19 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5001)
     parser.add_argument("--replica-url", default=REPLICA_URL)
     parser.add_argument("--async-delay", type=float, default=ASYNC_DELAY,
-                        help="seconds before an async update is delivered (default 5)")
+                        help="seconds before an async update reaches the replica (default 5)")
+    parser.add_argument("--response-delay", type=float, default=0.0,
+                        help="artificial delay for GET requests in seconds (default 0)")
     args = parser.parse_args()
 
     REPLICA_URL = args.replica_url.rstrip("/")
     ASYNC_DELAY = args.async_delay
+    RESPONSE_DELAY = args.response_delay
 
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s",
-                        datefmt="%H:%M:%S")
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    log.info("Catalog Primary on port %s, replica at %s, async delay %ss",
-             args.port, REPLICA_URL, ASYNC_DELAY)
-    app.run(host=args.host, port=args.port, debug=False)
+    log.info("Catalog Primary on port %s (replica %s, async delay %ss, response delay %ss)",
+             args.port, REPLICA_URL, ASYNC_DELAY, RESPONSE_DELAY)
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)

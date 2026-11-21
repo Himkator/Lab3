@@ -14,11 +14,27 @@ lock = threading.Lock()
 
 PRIMARY_URL = "http://127.0.0.1:5001"
 REPLICA_URL = "http://127.0.0.1:5002"
-CATALOG_TIMEOUT = 3
+PRIMARY_TIMEOUT = 1.0 
+REPLICA_TIMEOUT = 2.0 
 
 
 def is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def read_from_primary(product_id):
+    try:
+        resp = requests.get(f"{PRIMARY_URL}/products/{product_id}", timeout=PRIMARY_TIMEOUT)
+    except requests.exceptions.Timeout:
+        return None, (f"timeout after {PRIMARY_TIMEOUT}s: no answer in time "
+                      f"(the primary may be stopped, overloaded or just slow)")
+    except requests.exceptions.ConnectionError:
+        return None, "connection refused: nothing is listening on the primary port"
+    except requests.exceptions.RequestException as e:
+        return None, f"request error: {e.__class__.__name__}"
+    if resp.status_code >= 500:
+        return None, f"primary returned HTTP {resp.status_code}"
+    return resp, None
 
 
 @app.route("/orders", methods=["POST"])
@@ -28,24 +44,25 @@ def create_order():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Request body must be a JSON object"}), 400
-
     product_id = data.get("product_id")
     quantity = data.get("quantity", 1)
-    source = data.get("catalog_source", "primary")
-
     if not is_positive_int(product_id):
         return jsonify({"error": "Field 'product_id' is required and must be a positive integer"}), 400
     if not is_positive_int(quantity):
         return jsonify({"error": "Field 'quantity' must be a positive integer"}), 400
-    if source not in ("primary", "replica"):
-        return jsonify({"error": "Field 'catalog_source' must be 'primary' or 'replica'"}), 400
 
-    base_url = PRIMARY_URL if source == "primary" else REPLICA_URL
-    try:
-        resp = requests.get(f"{base_url}/products/{product_id}", timeout=CATALOG_TIMEOUT)
-    except requests.exceptions.RequestException:
-        log.error("catalogue (%s) is unreachable", source)
-        return jsonify({"error": f"Catalog {source} is unavailable. Please try again later."}), 503
+    source = "primary"
+    resp, primary_error = read_from_primary(product_id)
+
+    if resp is None:
+        log.warning("PRIMARY FAILED (%s) -> retrying the read from the REPLICA", primary_error)
+        source = "replica"
+        try:
+            resp = requests.get(f"{REPLICA_URL}/products/{product_id}", timeout=REPLICA_TIMEOUT)
+        except requests.exceptions.RequestException:
+            log.error("REPLICA FAILED too: no catalogue available")
+            return jsonify({"error": "Both catalogue services are unavailable. Please try again later.",
+                            "primary_error": primary_error}), 503
 
     if resp.status_code == 404:
         return jsonify({"error": f"Product with id {product_id} not found in catalog {source}"}), 404
@@ -61,21 +78,22 @@ def create_order():
 
     with lock:
         order = {
-            "id": next_id,
+            "order_id": next_id,
             "product_id": product_id,
             "product_name": name,
             "product_price": price,
             "product_stock": stock,
-            "product_version": version,
             "quantity": quantity,
             "total": price * quantity,
             "catalog_source": source,
+            "catalog_version": version,
+            "primary_error": primary_error, 
         }
         orders[next_id] = order
         next_id += 1
 
-    log.info("ORDER #%s created, product read from %s: %s price=%s stock=%s version=%s total=%s",
-             order["id"], source.upper(), name, price, stock, version, order["total"])
+    log.info("ORDER #%s created from %s: price=%s version=%s total=%s",
+             order["order_id"], source.upper(), price, version, order["total"])
     return jsonify(order), 201
 
 
@@ -85,6 +103,23 @@ def get_order(order_id):
     if order is None:
         return jsonify({"error": f"Order with id {order_id} not found"}), 404
     return jsonify(order), 200
+
+
+@app.route("/catalog-status", methods=["GET"])
+def catalog_status():
+    """Probe both catalogues' /health. A failed probe means 'suspected down', not proof."""
+    result = {}
+    for name, url, timeout in (("primary", PRIMARY_URL, PRIMARY_TIMEOUT),
+                               ("replica", REPLICA_URL, REPLICA_TIMEOUT)):
+        try:
+            r = requests.get(f"{url}/health", timeout=timeout)
+            result[name] = {"status": "ok" if r.status_code == 200 else "unhealthy",
+                            "http_status": r.status_code}
+        except requests.exceptions.Timeout:
+            result[name] = {"status": "suspected_down", "detail": f"no answer within {timeout}s"}
+        except requests.exceptions.RequestException:
+            result[name] = {"status": "suspected_down", "detail": "connection refused"}
+    return jsonify(result), 200
 
 
 @app.errorhandler(404)
@@ -108,14 +143,17 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5003)
     parser.add_argument("--primary-url", default=PRIMARY_URL)
     parser.add_argument("--replica-url", default=REPLICA_URL)
+    parser.add_argument("--primary-timeout", type=float, default=PRIMARY_TIMEOUT,
+                        help="seconds to wait for the primary before falling back (default 1)")
     args = parser.parse_args()
     PRIMARY_URL = args.primary_url.rstrip("/")
     REPLICA_URL = args.replica_url.rstrip("/")
+    PRIMARY_TIMEOUT = args.primary_timeout
 
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s",
-                        datefmt="%H:%M:%S")
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+                        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    log.info("Order Service on port %s (primary %s, replica %s)", args.port, PRIMARY_URL, REPLICA_URL)
-    app.run(host=args.host, port=args.port, debug=False)
+    log.info("Order Service on port %s (primary timeout %ss; fallback to replica %s)",
+             args.port, PRIMARY_TIMEOUT, REPLICA_URL)
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
